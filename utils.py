@@ -1,3 +1,4 @@
+from audioop import bias
 import glob
 from turtle import forward
 from typing import OrderedDict
@@ -10,6 +11,7 @@ from tqdm import tqdm
 import numpy as np
 import os
 from sklearn.preprocessing import StandardScaler
+from torch.optim import Adam
 # The data should be placed on the working directory path
 
 # Implementation of data parser
@@ -185,8 +187,8 @@ def collate_pad_zeros(batch):
     xs = [x[0] for x in batch]
     ys = [x[1] for x in batch]
     x_padded = pad_sequence(xs, batch_first=True)
-
-    return x_padded, ys
+    
+    return x_padded, torch.tensor(ys, dtype=torch.int64)
 
 class custom_dataset(Dataset):
     def __init__(self, X, y):
@@ -195,25 +197,174 @@ class custom_dataset(Dataset):
     def __len__(self):
         return len(self.X)
     def __getitem__(self,idx):
-        return torch.tensor(self.X[idx], dtype = torch.float32), torch.tensor(self.y[idx], dtype =torch.int64)
+        return torch.tensor(self.X[idx], dtype = torch.float32), self.y[idx]
     
 
 class lstm(nn.Module):
     def __init__(self, input_size = 39, hidden_size = 128,
-                num_layers = 3, out_classes = 10):
+                num_layers = 1, out_classes = 10, bidirectional = False):
         super(lstm, self).__init__()
-    
+        self.bidirectional = bidirectional
+        self.hidden_size = hidden_size
         self.main_body = nn.LSTM(input_size = input_size,
                             hidden_size = hidden_size,
-                            num_layers = num_layers,
-                            batch_first = True)
-
-        self.classifier = nn.Sequential(nn.Linear(hidden_size, 64),
-                                        nn.BatchNorm1d(64),
-                                        nn.ReLU(),
-                                        nn.Linear(64, 10))
+                            num_layers = num_layers, batch_first = True,
+                            bidirectional = bidirectional)
+        if self.bidirectional:
+            self.classifier = nn.Sequential(nn.Linear(2*hidden_size, hidden_size),
+                                            nn.BatchNorm1d(hidden_size),
+                                            nn.ReLU(),
+                                            nn.Linear(hidden_size, out_classes))
+        else:
+            self.classifier = nn.Sequential(nn.Linear(hidden_size, out_classes))
+            
     def forward(self,x):
-        x = self.main_body(x)
-        return self.classifier(x)
+        _,(x,_) = self.main_body(x)
+        if self.bidirectional:
+            x1 = x[0]
+            x2 = x[1]
+            return self.classifier(torch.cat((x1, x2), dim=1))
+        else:
+            return self.classifier(torch.squeeze(x))
         
+def training_loop(model, train_loader, val_loader, epochs,
+                  lr, loss_fn, regularization=None,
+                  reg_lambda=None, mod_epochs=20, early_stopping = False,
+                  patience = None, verbose = None, title = None):
+    optim = Adam(model.parameters(), lr=lr)
+    if torch.cuda.is_available():
+        device = "cuda"
+    else:
+        device = "cpu"
 
+    train_loss_list = []
+    val_loss_list = []
+    num_train_batches = len(train_loader)
+    num_val_batches = len(val_loader)
+    counter_epochs = 0
+
+    if early_stopping:
+        ear_stopping = EarlyStopping(patience= patience, verbose=verbose)
+
+    for epoch in range(epochs):
+        counter_epochs+=1
+        model.train()
+        train_loss, val_loss = 0.0, 0.0
+        for X,y in train_loader:
+            X, y = X.to(device), y.to(device)
+            preds = model(X)
+            loss = loss_fn(preds, y)
+            train_loss += loss.item()
+
+            # Regulirization
+            if regularization == 'L2':
+                l_norm = sum(p.pow(2.0).sum() for p in model.parameters())
+                loss = loss + reg_lambda * l_norm
+            elif regularization == 'L1':
+                l_norm = sum(p.abs().sum() for p in model.parameters())
+                loss = loss + reg_lambda * l_norm
+
+            # Backpropagation
+            optim.zero_grad()
+            loss.backward()
+            optim.step()
+        model.eval()
+        with torch.no_grad():
+            for val_batch in val_loader:
+                X, y = val_batch[0].to(device), val_batch[1].to(device)
+                preds = model(X)
+                val_loss += loss_fn(preds, y).item()
+        train_loss /= num_train_batches
+        val_loss /= num_val_batches
+        train_loss_list.append(train_loss)
+        val_loss_list.append(val_loss)
+        if (epoch + 1) % mod_epochs == 0:
+            print(
+                f"Epoch: {epoch + 1}/{epochs}{5 * ' '}Training Loss: {train_loss:.4f}{5 * ' '}Validation Loss: {val_loss:.4f}")
+
+        if early_stopping:
+            ear_stopping(val_loss, model)
+            if ear_stopping.early_stop:
+                print("Early stopping")
+                break
+
+    fig, ax = plt.subplots(figsize=(8, 8))
+    sns.set_style("dark")
+    ax.plot(range(1, counter_epochs + 1), train_loss_list, label='Train Loss')
+    ax.plot(range(1, counter_epochs + 1), val_loss_list, label='Val Loss')
+    ax.set_title("Train - Val Loss")
+    ax.set_ylabel("Loss")
+    ax.set_xlabel("Epochs")
+    plt.legend()
+    plt.show()
+
+    if early_stopping:
+        model.load_state_dict(torch.load("checkpoint.pt"))
+
+
+class EarlyStopping:
+    """Early stops the training if validation loss doesn't improve after a given patience."""
+    def __init__(self, patience=7, verbose=False, delta=0, path='checkpoint.pt', trace_func=print):
+        """
+        Args:
+            patience (int): How long to wait after last time validation loss improved.
+                            Default: 7
+            verbose (bool): If True, prints a message for each validation loss improvement.
+                            Default: False
+            delta (float): Minimum change in the monitored quantity to qualify as an improvement.
+                            Default: 0
+            path (str): Path for the checkpoint to be saved to.
+                            Default: 'checkpoint.pt'
+            trace_func (function): trace print function.
+                            Default: print
+        """
+        self.patience = patience
+        self.verbose = verbose
+        self.counter = 0
+        self.best_score = None
+        self.early_stop = False
+        self.val_loss_min = np.Inf
+        self.delta = delta
+        self.path = path
+        self.trace_func = trace_func
+    def __call__(self, val_loss, model):
+
+        score = -val_loss
+
+        if self.best_score is None:
+            self.best_score = score
+            self.save_checkpoint(val_loss, model)
+        elif score < self.best_score + self.delta:
+            self.counter += 1
+            if self.counter % 5 == 0:
+                self.trace_func(f'EarlyStopping counter: {self.counter} out of {self.patience}')
+            if self.counter >= self.patience:
+                self.early_stop = True
+        else:
+            self.best_score = score
+            self.save_checkpoint(val_loss, model)
+            self.counter = 0
+
+    def save_checkpoint(self, val_loss, model):
+        '''Saves model when validation loss decrease.'''
+        if self.verbose:
+            self.trace_func(f'Validation loss decreased ({self.val_loss_min:.6f} --> {val_loss:.6f}).  Saving model ...')
+        torch.save(model.state_dict(), self.path)
+        self.val_loss_min = val_loss
+
+
+def test_loop(model, test_dloader, device='cpu'):
+    predictions_list = np.array([], dtype=np.int64)
+    targets_list = np.array([], dtype=np.int64)
+    model.eval()
+
+    for val_sample in test_dloader:
+        X = val_sample[0].to(device)
+        y = val_sample[1].cpu().numpy()
+        targets_list = np.concatenate((targets_list, y))
+
+        with torch.no_grad():
+            preds = model(X)
+            predictions_list = np.concatenate((predictions_list,
+                                               torch.argmax(preds, dim=-1).cpu().numpy()))
+    return predictions_list, targets_list
